@@ -1,10 +1,8 @@
 import os
-import sys
-import torch 
-import torch.nn as nn 
-sys.path.append(os.path.join(os.path.dirname(__file__), '..', 'XPart/partgen'))
-from models import sonata
-from utils.misc import smart_load_model
+
+import sonata
+import torch
+from torch import nn
 
 '''
 This is the P3-SAM model.
@@ -15,7 +13,7 @@ The model is composed of three parts:
 '''
 def build_P3SAM(self): #build p3sam
     ######################## Sonata ########################
-    self.sonata = sonata.load("sonata", repo_id="facebook/sonata", download_root='/root/sonata')
+    self.sonata = sonata.load("sonata", repo_id="facebook/sonata")
     self.mlp = nn.Sequential(
             nn.Linear(1232, 512),
             nn.GELU(),
@@ -81,7 +79,7 @@ def build_P3SAM(self): #build p3sam
         )
     ######################## SEG2 ########################
 
-    
+
     self.iou_mlp = nn.Sequential( #iou predictor
             nn.Linear(512+3+3+3+256, 256),
             nn.GELU(),
@@ -104,13 +102,13 @@ If ckpt_path is not None, load the checkpoint from the given path.
 If state_dict is not None, load the state_dict from the given state_dict.
 If both ckpt_path and state_dict are None, download the model from huggingface and load the checkpoint.
 '''
-def load_state_dict(self, 
-                    ckpt_path=None, 
-                    state_dict=None, 
-                    strict=True, 
-                    assign=False, 
-                    ignore_seg_mlp=False, 
-                    ignore_seg_s2_mlp=False, 
+def load_state_dict(self,
+                    ckpt_path=None,
+                    state_dict=None,
+                    strict=True,
+                    assign=False,
+                    ignore_seg_mlp=False,
+                    ignore_seg_s2_mlp=False,
                     ignore_iou_mlp=False):   # load checkpoint
     if ckpt_path is not None:
         if ckpt_path.endswith('.pt') or ckpt_path.endswith('.ckpt'):
@@ -120,7 +118,7 @@ def load_state_dict(self,
             state_dict = load_file(ckpt_path)
     elif state_dict is None:
         # download from huggingface
-        print(f'trying to download model from huggingface...')
+        print('trying to download model from huggingface...')
         from huggingface_hub import hf_hub_download
         ckpt_path = hf_hub_download(repo_id="tencent/Hunyuan3D-Part", filename="p3sam/p3sam.safetensors", local_dir=os.path.join(os.path.expanduser('~'), '/.cache/p3sam/weights'))
         print(f'download model from huggingface to: {ckpt_path}')
@@ -158,4 +156,4 @@ def load_state_dict(self,
     if ignore_seg_s2_mlp and seg_s2_mlp_flag: #ignore seg_s2_mlp
         print("seg_s2_mlp is missing in loaded state dict, ignore seg_s2_mlp in loaded state dict")
     if ignore_iou_mlp and iou_mlp_flag: #ignore iou_mlp
-        print("iou_mlp is missing in loaded state dict, ignore iou_mlp in loaded state dict")   
+        print("iou_mlp is missing in loaded state dict, ignore iou_mlp in loaded state dict")

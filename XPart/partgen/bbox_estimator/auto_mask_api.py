@@ -1,30 +1,27 @@
+import copy
 import os
+import shutil
 import sys
-import torch
-import torch.nn as nn
-import numpy as np
-import argparse
-import trimesh
-from sklearn.decomposition import PCA
-import fpsample
-from tqdm import tqdm
-from collections import defaultdict
 
 # from tqdm.notebook import tqdm
 import time
-import copy
-import shutil
-from pathlib import Path
+from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
 
+import fpsample
+import numpy as np
+import torch
+import trimesh
 from numba import njit
+from sklearn.decomposition import PCA
+from torch import nn
+from tqdm import tqdm
 
 #################################
 # 修改sonata import路径
-from ..models import sonata
 
 #################################
-sys.path.append("../P3-SAM")
+sys.path.append(os.path.abspath(os.path.join(__file__, "../../../../P3-SAM")))
 from model import build_P3SAM, load_state_dict
 
 
@@ -33,21 +30,21 @@ class YSAM(nn.Module):
         super().__init__()
         build_P3SAM(self)
 
-    def load_state_dict(self, 
-                        ckpt_path=None, 
-                        state_dict=None, 
-                        strict=True, 
-                        assign=False, 
-                        ignore_seg_mlp=False, 
-                        ignore_seg_s2_mlp=False, 
+    def load_state_dict(self,
+                        ckpt_path=None,
+                        state_dict=None,
+                        strict=True,
+                        assign=False,
+                        ignore_seg_mlp=False,
+                        ignore_seg_s2_mlp=False,
                         ignore_iou_mlp=False):
-        load_state_dict(self, 
-                        ckpt_path=ckpt_path, 
-                        state_dict=state_dict, 
-                        strict=strict, 
-                        assign=assign, 
-                        ignore_seg_mlp=ignore_seg_mlp, 
-                        ignore_seg_s2_mlp=ignore_seg_s2_mlp, 
+        load_state_dict(self,
+                        ckpt_path=ckpt_path,
+                        state_dict=state_dict,
+                        strict=strict,
+                        assign=assign,
+                        ignore_seg_mlp=ignore_seg_mlp,
+                        ignore_seg_s2_mlp=ignore_seg_s2_mlp,
                         ignore_iou_mlp=ignore_iou_mlp)
 
     def forward(self, feats, points, point_prompt, iter=1):
