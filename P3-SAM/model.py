@@ -2,6 +2,7 @@ import os
 
 import sonata
 import torch
+from huggingface_hub import hf_hub_download
 from torch import nn
 
 '''
@@ -13,7 +14,13 @@ The model is composed of three parts:
 '''
 def build_P3SAM(self): #build p3sam
     ######################## Sonata ########################
-    self.sonata = sonata.load("sonata", repo_id="facebook/sonata")
+    ckpt_path = hf_hub_download(
+        repo_id="facebook/sonata",
+        filename="sonata.pth",
+        repo_type="model",
+        revision="main",
+    )
+    self.sonata = sonata.load(ckpt_path)
     self.mlp = nn.Sequential(
             nn.Linear(1232, 512),
             nn.GELU(),
