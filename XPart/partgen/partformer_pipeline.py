@@ -289,6 +289,8 @@ class PartFormerPipeline(TokenAllocMixin):
             self.vae.to(device)
             self.model.to(device)
             self.conditioner.to(device)
+        if self.bbox_predictor is not None:
+            self.bbox_predictor.to(device=device, dtype=dtype)
 
     def prepare_extra_step_kwargs(self, generator, eta):
         # prepare extra kwargs for the scheduler step, since not all schedulers have the same signature

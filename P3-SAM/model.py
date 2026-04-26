@@ -1,6 +1,5 @@
 import os
 
-import sonata
 import torch
 from huggingface_hub import hf_hub_download
 from torch import nn
@@ -14,6 +13,8 @@ The model is composed of three parts:
 '''
 def build_P3SAM(self): #build p3sam
     ######################## Sonata ########################
+    import sonata  # lazy: spconv initializes CUDA on all visible GPUs at import
+
     ckpt_path = hf_hub_download(
         repo_id="facebook/sonata",
         filename="sonata.pth",

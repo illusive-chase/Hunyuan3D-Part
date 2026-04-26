@@ -120,6 +120,7 @@ def normalize_pc(pc):
 
 @torch.no_grad()
 def get_feat(model, points, normals):
+    device = next(model.parameters()).device
     data_dict = {
         "coord": points,
         "normal": normals,
@@ -129,7 +130,7 @@ def get_feat(model, points, normals):
     data_dict = model.transform(data_dict)
     for k in data_dict:
         if isinstance(data_dict[k], torch.Tensor):
-            data_dict[k] = data_dict[k].cuda()
+            data_dict[k] = data_dict[k].to(device)
     point = model.sonata(data_dict)
     while "pooling_parent" in point.keys():
         assert "pooling_inverse" in point.keys()
@@ -153,12 +154,13 @@ def get_mask(model, feats, points, point_prompt, iter=1):
     """
     point_num = points.shape[0]
     prompt_num = point_prompt.shape[0]
+    device = feats.device
     feats = feats.unsqueeze(1)  # [N, 1, 512]
-    feats = feats.repeat(1, prompt_num, 1).cuda()  # [N, K, 512]
-    points = torch.from_numpy(points).float().cuda().unsqueeze(1)  # [N, 1, 3]
+    feats = feats.repeat(1, prompt_num, 1).to(device)  # [N, K, 512]
+    points = torch.from_numpy(points).float().to(device).unsqueeze(1)  # [N, 1, 3]
     points = points.repeat(1, prompt_num, 1)  # [N, K, 3]
     prompt_coord = (
-        torch.from_numpy(point_prompt).float().cuda().unsqueeze(0)
+        torch.from_numpy(point_prompt).float().to(device).unsqueeze(0)
     )  # [1, K, 3]
     prompt_coord = prompt_coord.repeat(point_num, 1, 1)  # [N, K, 3]
 
@@ -811,7 +813,6 @@ def mesh_sam(
     seed=42,
 ):
     with Timer("加载mesh"):
-        model, model_parallel = model
         if clean_mesh_flag:
             mesh = clean_mesh(mesh)
         mesh = trimesh.Trimesh(vertices=mesh.vertices, faces=mesh.faces, process=False)
@@ -877,7 +878,10 @@ def mesh_sam(
         print("采样完成")
 
     with Timer("推理"):
-        bs = 64
+        # bs=64 with N=100K creates [100K,64,512] float32 tensors (~13 GB).
+        # The original code used DataParallel to split across 8 GPUs.
+        # With single-GPU workers, bs=8 keeps peak at ~1.6 GB.
+        bs = 8
         step_num = prompt_num // bs + 1
         mask_res = []
         iou_res = []
@@ -893,7 +897,7 @@ def mesh_sam(
             #     model_parallel, _feats, _points, cur_propmt
             # )
             pred_mask_1, pred_mask_2, pred_mask_3, pred_iou = get_mask(
-                model_parallel, _feats, _points, cur_propmt
+                model, _feats, _points, cur_propmt
             )
             # print(pred_mask_1.shape, pred_mask_2.shape, pred_mask_3.shape, pred_iou.shape)
             pred_mask = np.stack(
@@ -1348,6 +1352,7 @@ class AutoMask:
         prompt_num=400,
         threshold=0.95,
         post_process=True,
+        **kwargs,
     ):
         """
         ckpt_path: str, 模型路径
@@ -1359,13 +1364,18 @@ class AutoMask:
         self.model = YSAM()
         self.model.load_state_dict(ckpt_path)
         self.model.eval()
-        self.model_parallel = torch.nn.DataParallel(self.model)
-        self.model.cuda()
-        self.model_parallel.cuda()
+        # Model stays on CPU; pipeline.to(device) moves it to the target GPU.
         self.point_num = point_num
         self.prompt_num = prompt_num
         self.threshold = threshold
         self.post_process = post_process
+
+    def to(self, device=None, dtype=None):
+        if device is not None:
+            self.model.to(device)
+        if dtype is not None:
+            self.model.to(dtype=dtype)
+        return self
 
     def predict_aabb(
         self,
@@ -1396,7 +1406,7 @@ class AutoMask:
         threshold = threshold if threshold is not None else self.threshold
         post_process = post_process if post_process is not None else self.post_process
         return mesh_sam(
-            [self.model, self.model_parallel],
+            self.model,
             mesh,
             save_path=save_path,
             point_num=point_num,

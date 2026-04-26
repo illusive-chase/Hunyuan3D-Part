@@ -1,6 +1,5 @@
 import torch
 import torch.nn as nn
-from .. import sonata
 
 from typing import Dict, Union, Optional
 from pathlib import Path
@@ -17,6 +16,11 @@ class SonataFeatureExtractor(nn.Module):
         ckpt_path: Optional[str] = "",
     ):
         super().__init__()
+
+        # Lazy import: sonata triggers spconv which initializes CUDA on all
+        # visible GPUs at import time.  Deferring to __init__ ensures
+        # CUDA_VISIBLE_DEVICES is already set by the caller.
+        from .. import sonata
 
         # Load Sonata model
         self.sonata = sonata.load_by_config(
