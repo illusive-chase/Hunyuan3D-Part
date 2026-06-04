@@ -1,6 +1,7 @@
 import torch
 from .utils.misc import logger, synchronize_timer
 import inspect
+from dataclasses import dataclass
 from typing import List, Optional
 import trimesh
 import numpy as np
@@ -27,6 +28,40 @@ from easydict import EasyDict
 import json
 from diffusers.utils.torch_utils import randn_tensor
 from pathlib import Path
+
+
+# Text2Part v2 patch: split PartFormer execution into observable stages while
+# preserving the original __call__ API for existing callers.
+@dataclass
+class PreparedInputs:
+    obj_surface: torch.Tensor
+    obj_surface_raw: Optional[dict]
+    mesh: Optional[trimesh.Trimesh]
+    center: np.ndarray
+    scale: float
+    seed: int
+
+
+@dataclass
+class BBoxInputs:
+    prepared: PreparedInputs
+    aabb: torch.Tensor
+
+    @property
+    def n_bbox(self) -> int:
+        return int(self.aabb.shape[0])
+
+
+@dataclass
+class PipelineInputs:
+    obj_surface: torch.Tensor
+    aabb: torch.Tensor
+    part_surface_inbbox: torch.Tensor
+    mesh: Optional[trimesh.Trimesh]
+    center: np.ndarray
+    scale: float
+    raw_bbox_count: int
+    valid_bbox_count: int
 
 
 @synchronize_timer("Export to trimesh")
@@ -391,40 +426,25 @@ class PartFormerPipeline(TokenAllocMixin):
         mesh.vertices = vertices
         return mesh, center, scale
 
-    def check_inputs(
+    # Text2Part v2 patch: split the original check_inputs path into CPU prep,
+    # bbox prediction, and CPU bbox sampling stages.
+    def prepare_inputs_cpu(
         self,
         obj_surface=None,
         obj_surface_raw=None,
         mesh_path=None,
         mesh=None,
-        aabb=None,
-        part_surface_inbbox=None,
         seed=42,
-    ):
-        """
-        Check the inputs of the pipeline.
-        Args:
-            obj_surface (`torch.Tensor`): [B, N, 3+3+1]
-            mesh_path (`str`): path to the mesh file
-            mesh (`trimesh.Trimesh`): mesh object
-            aabb (`torch.Tensor`): [B, K, 2, 3]
-            part_surface_inbbox (`torch.Tensor`): [B, K,N, 3+3+1]
-        """
+    ) -> PreparedInputs:
+        """CPU-only mesh load, normalization, and object-surface sampling."""
         if obj_surface is None:
             if mesh_path is None and (mesh is None and obj_surface_raw is None):
                 raise ValueError(
                     "obj_surface or mesh_path/mesh/obj_surface_raw must be provided."
                 )
-        elif aabb is None or part_surface_inbbox is None:
-            raise ValueError(
-                "aabb and part_surface_inbbox must be provided if obj_surface is"
-                " provided."
-            )
-        else:
-            assert aabb.shape[0] == part_surface_inbbox.shape[0], "Batch size mismatch."
         center = np.zeros(3)
         scale = 1.0
-        # 1. Load object surface and sample
+
         if obj_surface is None:
             if obj_surface_raw is None:
                 if mesh is not None:
@@ -451,32 +471,159 @@ class PartFormerPipeline(TokenAllocMixin):
                 return_normal=True,
             )
             obj_surface = obj_surface.unsqueeze(0)
-        # 2. load aabb
+        return PreparedInputs(
+            obj_surface=obj_surface,
+            obj_surface_raw=obj_surface_raw,
+            mesh=mesh,
+            center=center,
+            scale=scale,
+            seed=seed,
+        )
+
+    @torch.no_grad()
+    @torch.autocast("cuda", dtype=torch.bfloat16)
+    def predict_bboxes_gpu(
+        self,
+        prepared: PreparedInputs,
+        *,
+        aabb=None,
+        seed=42,
+    ) -> BBoxInputs:
+        """Run or normalize bbox prediction and return unbatched CPU bboxes."""
         if aabb is None:
-            aabb = self.predict_bbox(mesh, seed=seed)
+            if prepared.mesh is None:
+                raise ValueError("mesh is required when aabb is not provided.")
+            aabb = self.predict_bbox(prepared.mesh, seed=seed)
             print(f"Get bbox from bbox_predictor: {aabb.shape}")
         else:
             if isinstance(aabb, np.ndarray):
                 aabb = torch.from_numpy(aabb)
+            else:
+                aabb = aabb.detach().cpu()
             # normalize aabb by mesh scale and center
             aabb = aabb.float()
-            aabb = (aabb - torch.from_numpy(center).float()) / scale
+            aabb = (aabb - torch.from_numpy(prepared.center).float()) / prepared.scale
 
-        # 3. load part surface in bbox
+        if aabb.ndim == 4:
+            if aabb.shape[0] != 1:
+                raise AssertionError("Batch size > 1 is not supported yet.")
+            aabb = aabb[0]
+        return BBoxInputs(prepared=prepared, aabb=aabb.float().cpu())
+
+    @staticmethod
+    def _valid_bbox_mask(mesh: trimesh.Trimesh, aabb: torch.Tensor) -> torch.Tensor:
+        _faces = mesh.faces
+        _vertices = mesh.vertices
+        _faces = np.reshape(_faces, (-1))
+        num_parts = aabb.shape[0]
+        if num_parts == 0:
+            return torch.zeros((0,), dtype=torch.bool)
+        _points = torch.from_numpy(_vertices[_faces])
+        _part_mask = torch.all(
+            (_points[None, :, :3] >= aabb[:, :1])
+            & (_points[None, :, :3] <= aabb[:, 1:]),
+            dim=-1,
+        )
+        _part_mask = torch.any(torch.reshape(_part_mask, (num_parts, -1, 3)), dim=-1)
+        return torch.tensor(
+            [len(torch.nonzero(x).squeeze(-1)) > 0 for x in _part_mask],
+            dtype=torch.bool,
+            device=_points.device,
+        )
+
+    def finish_inputs_cpu(
+        self,
+        bbox_inputs: BBoxInputs,
+        *,
+        part_surface_inbbox=None,
+        seed=42,
+    ) -> PipelineInputs:
+        """CPU-only sampling of object points inside each bbox."""
+        prepared = bbox_inputs.prepared
+        aabb = bbox_inputs.aabb
         if part_surface_inbbox is None:
-            part_surface_inbbox, valid_parts_mask = sample_bbox_points_from_trimesh(
-                mesh, aabb, num_points=81920, seed=seed
-            )
+            if prepared.mesh is None:
+                raise ValueError(
+                    "mesh is required when part_surface_inbbox is not provided."
+                )
+            valid_parts_mask = self._valid_bbox_mask(prepared.mesh, aabb)
             aabb = aabb[valid_parts_mask]
-            aabb = aabb.unsqueeze(0)
-            part_surface_inbbox = part_surface_inbbox.unsqueeze(0)
+            if aabb.shape[0] == 0:
+                part_surface_inbbox = torch.empty((1, 0, 81920, 7))
+                aabb = aabb.unsqueeze(0)
+            else:
+                part_surface_inbbox, valid_parts_mask = sample_bbox_points_from_trimesh(
+                    prepared.mesh, aabb, num_points=81920, seed=seed
+                )
+                aabb = aabb[valid_parts_mask]
+                aabb = aabb.unsqueeze(0)
+                part_surface_inbbox = part_surface_inbbox.unsqueeze(0)
+        else:
+            if isinstance(part_surface_inbbox, np.ndarray):
+                part_surface_inbbox = torch.from_numpy(part_surface_inbbox)
+            if aabb.ndim == 3:
+                aabb = aabb.unsqueeze(0)
+            if part_surface_inbbox.ndim == 3:
+                part_surface_inbbox = part_surface_inbbox.unsqueeze(0)
+
+        return PipelineInputs(
+            obj_surface=prepared.obj_surface,
+            aabb=aabb,
+            part_surface_inbbox=part_surface_inbbox,
+            mesh=prepared.mesh,
+            center=prepared.center,
+            scale=prepared.scale,
+            raw_bbox_count=bbox_inputs.n_bbox,
+            valid_bbox_count=int(aabb.shape[1]),
+        )
+
+    def check_inputs(
+        self,
+        obj_surface=None,
+        obj_surface_raw=None,
+        mesh_path=None,
+        mesh=None,
+        aabb=None,
+        part_surface_inbbox=None,
+        seed=42,
+    ):
+        """
+        Check the inputs of the pipeline.
+        Args:
+            obj_surface (`torch.Tensor`): [B, N, 3+3+1]
+            mesh_path (`str`): path to the mesh file
+            mesh (`trimesh.Trimesh`): mesh object
+            aabb (`torch.Tensor`): [B, K, 2, 3]
+            part_surface_inbbox (`torch.Tensor`): [B, K,N, 3+3+1]
+        """
+        if obj_surface is not None:
+            if aabb is None or part_surface_inbbox is None:
+                raise ValueError(
+                    "aabb and part_surface_inbbox must be provided if obj_surface is"
+                    " provided."
+                )
+            assert aabb.shape[0] == part_surface_inbbox.shape[0], "Batch size mismatch."
+
+        prepared = self.prepare_inputs_cpu(
+            obj_surface=obj_surface,
+            obj_surface_raw=obj_surface_raw,
+            mesh_path=mesh_path,
+            mesh=mesh,
+            seed=seed,
+        )
+        bbox_inputs = self.predict_bboxes_gpu(prepared, aabb=aabb, seed=seed)
+        inputs = self.finish_inputs_cpu(
+            bbox_inputs,
+            part_surface_inbbox=part_surface_inbbox,
+            seed=seed,
+        )
         return (
-            obj_surface,
-            aabb,
-            part_surface_inbbox,
-            mesh,
-            center,
-            scale,
+            inputs.obj_surface,
+            inputs.aabb,
+            inputs.part_surface_inbbox,
+            inputs.mesh,
+            inputs.center,
+            inputs.scale,
         )
 
     def get_guidance_scale_embedding(self, w, embedding_dim=512, dtype=torch.float32):
@@ -542,6 +689,177 @@ class PartFormerPipeline(TokenAllocMixin):
 
         return outputs
 
+    # Text2Part v2 patch: keep the GPU diffusion block callable without mesh
+    # preparation/export so the scheduler can profile and short-circuit passes.
+    @torch.no_grad()
+    @torch.autocast("cuda", dtype=torch.bfloat16)
+    def run_diffusion_gpu(
+        self,
+        inputs: PipelineInputs,
+        *,
+        generator,
+        num_inference_steps: int = 50,
+        timesteps: Optional[List[int]] = None,
+        sigmas: Optional[List[float]] = None,
+        eta: float = 0.0,
+        guidance_scale: float = -1.0,
+        dual_guidance_scale: float = 10.5,
+        dual_guidance: bool = True,
+        callback=None,
+        callback_steps=None,
+        enable_pbar=True,
+    ):
+        """Move prepared inputs to GPU and run condition encoding + diffusion."""
+        do_classifier_free_guidance = guidance_scale >= 0 and not (
+            hasattr(self.model, "guidance_embed") and self.model.guidance_embed is True
+        )
+        device = self.device
+        dtype = self.dtype
+
+        obj_surface = inputs.obj_surface.to(device=device, dtype=dtype)
+        aabb = inputs.aabb.to(device=device, dtype=dtype)
+        part_surface_inbbox = inputs.part_surface_inbbox.to(device=device, dtype=dtype)
+        batch_size, num_parts, N, dim = part_surface_inbbox.shape
+        # TODO: support batch size > 1
+        assert batch_size == 1, "Batch size > 1 is not supported yet."
+
+        num_tokens = torch.tensor(
+            [self.allocate_tokens(x, self.vae.latent_shape[0]) for x in aabb],
+            device=device,
+        )
+        latent_shape = self.vae.latent_shape
+        latents = self.prepare_latents(
+            num_parts, latent_shape, dtype, device, generator
+        )
+        extra_step_kwargs = self.prepare_extra_step_kwargs(generator, eta)
+
+        cond = self.encode_cond(
+            part_surface_inbbox.reshape(batch_size * num_parts, N, dim),
+            obj_surface.expand(batch_size * num_parts, -1, -1),
+            do_classifier_free_guidance,
+        )
+
+        guidance_cond = None
+        if getattr(self.model, "guidance_cond_proj_dim", None) is not None:
+            logger.info("Using lcm guidance scale")
+            guidance_scale_tensor = torch.tensor(guidance_scale - 1).repeat(batch_size)
+            guidance_cond = self.get_guidance_scale_embedding(
+                guidance_scale_tensor, embedding_dim=self.model.guidance_cond_proj_dim
+            ).to(device=device, dtype=latents.dtype)
+
+        if sigmas is None and timesteps is None:
+            sigmas = np.linspace(0, 1, num_inference_steps)
+        timesteps, num_inference_steps = retrieve_timesteps(
+            self.scheduler,
+            num_inference_steps,
+            device,
+            timesteps=timesteps,
+            sigmas=sigmas,
+        )
+
+        torch.cuda.empty_cache()
+
+        with synchronize_timer("Diffusion Sampling"):
+            for i, t in enumerate(
+                tqdm(timesteps, disable=not enable_pbar, desc="Diffusion Sampling:")
+            ):
+                if do_classifier_free_guidance:
+                    latent_model_input = torch.cat([latents] * 2)
+                    aabb_model_input = torch.repeat_interleave(aabb, 2, dim=0)
+                else:
+                    latent_model_input = latents
+                    aabb_model_input = aabb
+
+                timestep = t.expand(latent_model_input.shape[0]).to(latents.dtype)
+                timestep = timestep / self.scheduler.config.num_train_timesteps
+                noise_pred = self.model(
+                    latent_model_input,
+                    timestep,
+                    cond,
+                    aabb=aabb_model_input,
+                    num_tokens=num_tokens,
+                    guidance_cond=guidance_cond,
+                )
+
+                if do_classifier_free_guidance:
+                    noise_pred_cond, noise_pred_uncond = noise_pred.chunk(2)
+                    noise_pred = noise_pred_uncond + guidance_scale * (
+                        noise_pred_cond - noise_pred_uncond
+                    )
+
+                outputs = self.scheduler.step(noise_pred, t, latents, **extra_step_kwargs)
+                latents = outputs.prev_sample
+
+                if callback is not None and i % callback_steps == 0:
+                    step_idx = i // getattr(self.scheduler, "order", 1)
+                    callback(step_idx, t, outputs)
+
+        return latents, {
+            "num_parts": num_parts,
+            "num_inference_steps": num_inference_steps,
+            "do_classifier_free_guidance": do_classifier_free_guidance,
+            "raw_bbox_count": inputs.raw_bbox_count,
+            "valid_bbox_count": inputs.valid_bbox_count,
+        }
+
+    @torch.no_grad()
+    @torch.autocast("cuda", dtype=torch.bfloat16)
+    def export_latents(
+        self,
+        latents,
+        *,
+        center: np.ndarray,
+        scale: float,
+        output_type: Optional[str] = "trimesh",
+        box_v=1.01,
+        octree_resolution=512,
+        mc_level=-1 / 512,
+        num_chunks=400000,
+        mc_algo="mc",
+        enable_pbar=True,
+    ):
+        """Export part latents and denormalize them into a trimesh.Scene."""
+        out = trimesh.Scene()
+        for i, part_latent in enumerate(latents):
+            try:
+                part_mesh = self._export(
+                    latents=part_latent.unsqueeze(0),
+                    output_type=output_type,
+                    box_v=box_v,
+                    mc_level=mc_level,
+                    num_chunks=num_chunks,
+                    octree_resolution=octree_resolution,
+                    mc_algo=mc_algo,
+                    enable_pbar=enable_pbar,
+                )[0]
+                out.add_geometry(part_mesh)
+                random_color = np.random.randint(0, 255, size=3)
+                part_mesh.visual.face_colors = random_color
+            except Exception as e:
+                logger.error(f"Failed to export part {i} with error {e}")
+        print(f"Denormalize mesh: {center}, {scale}")
+        for key in out.geometry.keys():
+            _v = out.geometry[key].vertices
+            _v = _v * scale + center
+            out.geometry[key].vertices = _v
+        return out
+
+    def _bbox_debug_scene(self, inputs: PipelineInputs):
+        mesh_bbox = trimesh.Scene()
+        if inputs.mesh is not None:
+            mesh_bbox.add_geometry(inputs.mesh)
+        else:
+            mesh = trimesh.points.PointCloud(
+                inputs.obj_surface[0, :, :3].float().cpu().numpy()
+            )
+            mesh_bbox.add_geometry(mesh)
+        for bbox in inputs.aabb[0]:
+            box = trimesh.path.creation.box_outline()
+            box.vertices *= (bbox[1] - bbox[0]).float().cpu().numpy()
+            box.vertices += (bbox[0] + bbox[1]).float().cpu().numpy() / 2
+            mesh_bbox.add_geometry(box)
+        return mesh_bbox
+
     @torch.no_grad()
     @torch.autocast("cuda", dtype=torch.bfloat16)
     def __call__(
@@ -582,155 +900,68 @@ class PartFormerPipeline(TokenAllocMixin):
         """
         callback = kwargs.pop("callback", None)
         callback_steps = kwargs.pop("callback_steps", None)
-        do_classifier_free_guidance = guidance_scale >= 0 and not (
-            hasattr(self.model, "guidance_embed") and self.model.guidance_embed is True
-        )
-        # 1. Check inputs and predict bbox if not provided
-        device = self.device
-        dtype = self.dtype
-        obj_surface, aabb, part_surface_inbbox, mesh, center, scale = self.check_inputs(
-            obj_surface,
-            obj_surface_raw,
-            mesh_path,
-            mesh,
-            aabb,
-            part_surface_inbbox,
+
+        if obj_surface is not None:
+            if aabb is None or part_surface_inbbox is None:
+                raise ValueError(
+                    "aabb and part_surface_inbbox must be provided if obj_surface is"
+                    " provided."
+                )
+            assert aabb.shape[0] == part_surface_inbbox.shape[0], "Batch size mismatch."
+
+        prepared = self.prepare_inputs_cpu(
+            obj_surface=obj_surface,
+            obj_surface_raw=obj_surface_raw,
+            mesh_path=mesh_path,
+            mesh=mesh,
             seed=seed,
         )
+        bbox_inputs = self.predict_bboxes_gpu(prepared, aabb=aabb, seed=seed)
+        inputs = self.finish_inputs_cpu(
+            bbox_inputs,
+            part_surface_inbbox=part_surface_inbbox,
+            seed=seed,
+        )
+
         if self.verbose:
-            # return gt mesh with bbox
-            mesh_bbox = trimesh.Scene()
-            if mesh is not None:
-                mesh_bbox.add_geometry(mesh)
-            else:
-                mesh = trimesh.points.PointCloud(
-                    obj_surface[0, :, :3].float().cpu().numpy()
-                )
-                mesh_bbox.add_geometry(mesh)
-            for bbox in aabb[0]:
-                box = trimesh.path.creation.box_outline()
-                box.vertices *= (bbox[1] - bbox[0]).float().cpu().numpy()
-                box.vertices += (bbox[0] + bbox[1]).float().cpu().numpy() / 2
-                mesh_bbox.add_geometry(box)
-        #  Convert to device and dtype
-        obj_surface = obj_surface.to(device=device, dtype=dtype)
-        aabb = aabb.to(device=device, dtype=dtype)
-        part_surface_inbbox = part_surface_inbbox.to(device=device, dtype=dtype)
-        batch_size, num_parts, N, dim = part_surface_inbbox.shape
-        # TODO: support batch size > 1
-        assert batch_size == 1, "Batch size > 1 is not supported yet."
-        # 2. Prepare latent variables
-        # TODO:allocate tokens for each parts
-        num_tokens = torch.tensor(
-            [self.allocate_tokens(x, self.vae.latent_shape[0]) for x in aabb],
-            device=device,
-        )
-        latent_shape = self.vae.latent_shape
-        latents = self.prepare_latents(
-            num_parts, latent_shape, dtype, device, generator
-        )
-        extra_step_kwargs = self.prepare_extra_step_kwargs(generator, eta)
-        # 3. condition
-        cond = self.encode_cond(
-            part_surface_inbbox.reshape(batch_size * num_parts, N, dim),
-            obj_surface.expand(batch_size * num_parts, -1, -1),
-            do_classifier_free_guidance,
-        )
-        # 4. guidance_cond for controling sampling
-        guidance_cond = None
-        if getattr(self.model, "guidance_cond_proj_dim", None) is not None:
-            logger.info("Using lcm guidance scale")
-            guidance_scale_tensor = torch.tensor(guidance_scale - 1).repeat(batch_size)
-            guidance_cond = self.get_guidance_scale_embedding(
-                guidance_scale_tensor, embedding_dim=self.model.guidance_cond_proj_dim
-            ).to(device=device, dtype=latents.dtype)
+            mesh_bbox = self._bbox_debug_scene(inputs)
 
-        # 5. Prepare timesteps
-        # NOTE: this is slightly different from common usage, we start from 0.
-        sigmas = np.linspace(0, 1, num_inference_steps) if sigmas is None else sigmas
-        timesteps, num_inference_steps = retrieve_timesteps(
-            self.scheduler,
-            num_inference_steps,
-            device,
+        latents, _meta = self.run_diffusion_gpu(
+            inputs,
+            generator=generator,
+            num_inference_steps=num_inference_steps,
+            timesteps=timesteps,
             sigmas=sigmas,
+            eta=eta,
+            guidance_scale=guidance_scale,
+            dual_guidance_scale=dual_guidance_scale,
+            dual_guidance=dual_guidance,
+            callback=callback,
+            callback_steps=callback_steps,
+            enable_pbar=enable_pbar,
         )
-
-        torch.cuda.empty_cache()
-
-        # 6. Denoising loop
-        with synchronize_timer("Diffusion Sampling"):
-            for i, t in enumerate(
-                tqdm(timesteps, disable=not enable_pbar, desc="Diffusion Sampling:")
-            ):
-                # expand the latents if we are doing classifier free guidance
-                if do_classifier_free_guidance:
-                    latent_model_input = torch.cat([latents] * 2)
-                    aabb = torch.repeat_interleave(aabb, 2, dim=0)
-                else:
-                    latent_model_input = latents
-
-                # NOTE: we assume model get timesteps ranged from 0 to 1
-                timestep = t.expand(latent_model_input.shape[0]).to(latents.dtype)
-                timestep = timestep / self.scheduler.config.num_train_timesteps
-                noise_pred = self.model(
-                    latent_model_input,
-                    timestep,
-                    cond,
-                    aabb=aabb,
-                    num_tokens=num_tokens,
-                    guidance_cond=guidance_cond,
-                )
-
-                if do_classifier_free_guidance:
-                    noise_pred_cond, noise_pred_uncond = noise_pred.chunk(2)
-                    noise_pred = noise_pred_uncond + guidance_scale * (
-                        noise_pred_cond - noise_pred_uncond
-                    )
-
-                # compute the previous noisy sample x_t -> x_t-1
-                outputs = self.scheduler.step(noise_pred, t, latents)
-                latents = outputs.prev_sample
-
-                if callback is not None and i % callback_steps == 0:
-                    step_idx = i // getattr(self.scheduler, "order", 1)
-                    callback(step_idx, t, outputs)
-
-        # latents2mesh
-        # part_latents = torch.split(latents, num_tokens[0].tolist(), dim=1)
-        out = trimesh.Scene()
-        for i, part_latent in enumerate(latents):
-            try:
-                part_mesh = self._export(
-                    latents=part_latent.unsqueeze(0),
-                    output_type=output_type,
-                    box_v=box_v,
-                    mc_level=mc_level,
-                    num_chunks=num_chunks,
-                    octree_resolution=octree_resolution,
-                    mc_algo=mc_algo,
-                    enable_pbar=enable_pbar,
-                )[0]
-                out.add_geometry(part_mesh)
-                random_color = np.random.randint(0, 255, size=3)
-                part_mesh.visual.face_colors = random_color
-            except Exception as e:
-                logger.error(f"Failed to export part {i} with error {e}")
-        print(f"Denormalize mesh: {center}, {scale}")
-        for key in out.geometry.keys():
-            _v = out.geometry[key].vertices
-            _v = _v * scale + center
-            out.geometry[key].vertices = _v
+        out = self.export_latents(
+            latents,
+            center=inputs.center,
+            scale=inputs.scale,
+            output_type=output_type,
+            box_v=box_v,
+            octree_resolution=octree_resolution,
+            mc_level=mc_level,
+            num_chunks=num_chunks,
+            mc_algo=mc_algo,
+            enable_pbar=enable_pbar,
+        )
 
         if self.verbose:
             explode_object = explode_mesh(copy.deepcopy(out), explosion_scale=0.2)
-            # add bbox into out
             out_bbox = trimesh.Scene()
             out_bbox.add_geometry(out)
-            for bbox in aabb[0]:
+            for bbox in inputs.aabb[0]:
                 box = trimesh.path.creation.box_outline()
                 box.vertices *= (bbox[1] - bbox[0]).float().cpu().numpy()
                 box.vertices += (bbox[0] + bbox[1]).float().cpu().numpy() / 2
-                box.vertices = box.vertices * scale + center
+                box.vertices = box.vertices * inputs.scale + inputs.center
                 out_bbox.add_geometry(box)
             return out, (out_bbox, mesh_bbox, explode_object)
         else:
