@@ -10,6 +10,7 @@ from einops import repeat
 import traceback
 import pymeshlab
 import tempfile
+from pathlib import Path
 
 
 def random_sample_pointcloud(mesh: trimesh.Trimesh, num=30000, seed=42):
@@ -742,9 +743,10 @@ def extract_geometry_fast(
 
 
 def pymeshlab2trimesh(mesh: pymeshlab.MeshSet):
-    with tempfile.NamedTemporaryFile(suffix=".ply", delete=False) as temp_file:
-        mesh.save_current_mesh(temp_file.name)
-        mesh = trimesh.load(temp_file.name)
+    with tempfile.TemporaryDirectory(prefix="xpart_mesh_") as tmpdir:
+        temp_path = Path(tmpdir) / "mesh.ply"
+        mesh.save_current_mesh(str(temp_path))
+        mesh = trimesh.load(str(temp_path))
     # 检查加载的对象类型
     if isinstance(mesh, trimesh.Scene):
         combined_mesh = trimesh.Trimesh()
@@ -756,7 +758,8 @@ def pymeshlab2trimesh(mesh: pymeshlab.MeshSet):
 
 
 def trimesh2pymeshlab(mesh: trimesh.Trimesh):
-    with tempfile.NamedTemporaryFile(suffix=".ply", delete=False) as temp_file:
+    with tempfile.TemporaryDirectory(prefix="xpart_mesh_") as tmpdir:
+        temp_path = Path(tmpdir) / "mesh.ply"
         if isinstance(mesh, trimesh.scene.Scene):
             for idx, obj in enumerate(mesh.geometry.values()):
                 if idx == 0:
@@ -764,9 +767,9 @@ def trimesh2pymeshlab(mesh: trimesh.Trimesh):
                 else:
                     temp_mesh = temp_mesh + obj
             mesh = temp_mesh
-        mesh.export(temp_file.name)
+        mesh.export(str(temp_path))
         mesh = pymeshlab.MeshSet()
-        mesh.load_new_mesh(temp_file.name)
+        mesh.load_new_mesh(str(temp_path))
     return mesh
 
 
